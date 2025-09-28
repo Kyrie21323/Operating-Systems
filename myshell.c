@@ -19,14 +19,16 @@ void parse_command(char *cmd, char *args[], char **inputFile, char **outputFile,
         if (strcmp(token, "<") == 0) {
             token = strtok(NULL, " \t\n"); //next part is filename
             *inputFile = token;
+            continue;                      //skip adding filename to args
         } else if (strcmp(token, ">") == 0) {
             token = strtok(NULL, " \t\n"); //next part is filename
             *outputFile = token;
+            continue;                      //skip adding filename to args
         } else if (strcmp(token, "2>") == 0) {
             token = strtok(NULL, " \t\n"); //next part is filename
             *errorFile = token;
+            continue;                      //skip adding filename to args
         } else {
-            
             args[i++] = token;
         }
         token = strtok(NULL, " \t\n");
