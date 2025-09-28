@@ -18,15 +18,33 @@ void parse_command(char *cmd, char *args[], char **inputFile, char **outputFile,
         //check for redirection symbols
         if (strcmp(token, "<") == 0) {
             token = strtok(NULL, " \t\n"); //next part is filename
+            if (token == NULL) {
+                printf("Input file not specified.\n");
+                args[0] = NULL;
+                return;
+            }
             *inputFile = token;
+            token = strtok(NULL, " \t\n");
             continue;                      //skip adding filename to args
         } else if (strcmp(token, ">") == 0) {
             token = strtok(NULL, " \t\n"); //next part is filename
+            if (token == NULL) {
+                printf("Output file not specified.\n");
+                args[0] = NULL;
+                return;
+            }
             *outputFile = token;
+            token = strtok(NULL, " \t\n");
             continue;                      //skip adding filename to args
         } else if (strcmp(token, "2>") == 0) {
             token = strtok(NULL, " \t\n"); //next part is filename
+            if (token == NULL) {
+                printf("Error output file not specified.\n");
+                args[0] = NULL;
+                return;
+            }
             *errorFile = token;
+            token = strtok(NULL, " \t\n");
             continue;                      //skip adding filename to args
         } else {
             args[i++] = token;
@@ -53,7 +71,7 @@ void execute_command(char *args[], char *inputFile, char *outputFile, char *erro
         if (inputFile != NULL) {
             int fd_in = open(inputFile, O_RDONLY);
             if (fd_in < 0) {
-                perror("bad input file");
+                printf("File not found: %s\n", inputFile);
                 exit(EXIT_FAILURE);
             }
             //redirect stdin to file
@@ -89,6 +107,7 @@ void execute_command(char *args[], char *inputFile, char *outputFile, char *erro
         //run the command
         if (execvp(args[0], args) < 0) {
             //execvp failed, something is wrong
+            printf("Command not found.\n");
             perror("exec failed");
             exit(EXIT_FAILURE);
         }
@@ -132,7 +151,6 @@ int main() {
         }
     }
 
-    printf("Exiting myshell.\n");
     return 0;
 }
 
