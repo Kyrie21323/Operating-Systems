@@ -25,9 +25,9 @@ This function advances the pointer past any spaces, tabs, or newlines at the beg
 static char* skip_whitespace(char *str){
     //loop through string while current character is whitespace
     while(*str == ' ' || *str == '\t' || *str == '\n'){
-        str++;                  //move pointer to next character
+        str++;
     }
-    return str;                 //return pointer to first non-whitespace character
+    return str;
 }
 
 /*utility function to check if a string is empty after removing leading/trailing whitespace
@@ -75,7 +75,7 @@ int validate_pipeline(char *cmd){
         token = strtok_r(NULL, "|", &saveptr);                  //get next token
     }
     
-    return 0;                                                  //pipeline syntax is valid
+    return 0;
 }
 
 //structure definition for pipeline stages
