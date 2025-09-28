@@ -5,95 +5,124 @@
 #include <sys/wait.h> 
 #include <fcntl.h>    
 
+//maximum length for command input buffer
 #define MAX_CMD_LENGTH 1024 
-#define MAX_ARGS 64
-#define MAX_PIPES 10         
+//maximum number of arguments a command can have
+#define MAX_ARGS 64         
+//maximum number of pipes in a pipeline
+#define MAX_PIPES 10
 
-//function declarations
-void parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, char **errorFile);
+//forward function declarations to tell compiler about functions defined later
+int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, char **errorFile, int isPipeline);
+int validate_pipeline(char *cmd);
+void execute_command(char *args[], char *inputFile, char *outputFile, char *errorFile);
+void execute_pipeline(char *cmd);
+static int setup_redirection(const char *filename, int flags, int target_fd);
 
-//function to validate pipeline syntax
-int validate_pipeline(char *cmd){
-    //check for leading pipe
-    while(*cmd == ' ' || *cmd == '\t' || *cmd == '\n'){
-        cmd++;
+/*utility function to skip leading whitespace characters.
+This function advances the pointer past any spaces, tabs, or newlines at the beginning of a string, returning a pointer to the first non-whitespace character
+*/
+static char* skip_whitespace(char *str){
+    //loop through string while current character is whitespace
+    while(*str == ' ' || *str == '\t' || *str == '\n'){
+        str++;                  //move pointer to next character
     }
-    if(*cmd == '|'){
+    return str;                 //return pointer to first non-whitespace character
+}
+
+/*utility function to check if a string is empty after removing leading/trailing whitespace
+This function determines if a string contains only whitespace characters
+*/
+static int is_empty_after_trim(char *str){
+    str = skip_whitespace(str);             //skip leading whitespace
+    return *str == '\0';                    //return true if we reached end of string (empty)
+}
+
+/*pipeline validation function to check if pipeline syntax is correct
+This function validates that pipes are used correctly and there are no empty commands. Returns 0 for valid pipeline, -1 for invalid pipeline with error message printed
+*/
+int validate_pipeline(char *cmd){
+    //skip leading whitespace to find actual start of command
+    char *p = skip_whitespace(cmd);
+    
+    //check for leading pipe (command starts with |)
+    if(*p == '|'){
         printf("Command missing after pipe.\n");
         return -1;
     }
     
     //check for trailing pipe
-    int len = strlen(cmd);
-    while(len > 0 && (cmd[len-1] == ' ' || cmd[len-1] == '\t' || cmd[len-1] == '\n')){
+    int len = strlen(p);
+    //work backwards from end, skipping trailing whitespace
+    while(len > 0 && (p[len-1] == ' ' || p[len-1] == '\t' || p[len-1] == '\n')){
         len--;
     }
-    if(len > 0 && cmd[len-1] == '|'){
+    //if last non-whitespace character is |, it's invalid
+    if(len > 0 && p[len-1] == '|'){
         printf("Command missing after pipe.\n");
         return -1;
     }
     
-    //check for empty stages (|| or | |)
-    char *ptr = cmd;
-    while(*ptr){
-        if(*ptr == '|'){
-            ptr++;
-            //skip whitespace after |
-            while(*ptr == ' ' || *ptr == '\t' || *ptr == '\n'){
-                ptr++;
-            }
-            //if we hit another | or end of string, it's empty
-            if(*ptr == '|' || *ptr == '\0'){
-                printf("Empty command between pipes.\n");
-                return -1;
-            }
-        }else{
-            ptr++;
+    //check for empty commands between pipes
+    char *saveptr;
+    char *token = strtok_r(p, "|", &saveptr);               //split by pipe character
+    while(token != NULL){
+        //check if this token (command between pipes) is empty after trimming whitespace
+        if(is_empty_after_trim(token)){
+            printf("Empty command between pipes.\n");
+            return -1;
         }
+        token = strtok_r(NULL, "|", &saveptr);                  //get next token
     }
     
-    return 0;
+    return 0;                                                  //pipeline syntax is valid
 }
 
-//structure to hold stage information
-typedef struct{
+//structure definition for pipeline stages
+//each stage in a pipeline is a separate command with its own arguments and redirections
+typedef struct {
     char *args[MAX_ARGS];
     char *inputFile;
     char *outputFile;
     char *errorFile;
-}
-Stage;
+} Stage;
 
-//function to execute piped commands
+/*main pipeline execution function that handles commands with pipes (|)
+this function creates multiple processes and connects their input/output streams using pipe() and dup2() system calls to simulate shell pipeline behavior
+*/
 void execute_pipeline(char *cmd){
-    //validate pipeline syntax first
+    //validate that the pipeline syntax is correct
     if(validate_pipeline(cmd) != 0){
         return;
     }
     
-    //split into stages
+    //array to store information about each stage in the pipeline
     Stage stages[MAX_PIPES];
-    int numStages = 0;
+    int numStages = 0;                  //counter for number of stages found
+    int hasErrors = 0;                  //flag to track if any stage had parsing errors
     
-    char *saveptr;  //for strtok_r
-    char *stage_cmd = strtok_r(cmd, "|", &saveptr);
+    //split the command by pipe characters using strtok_r
+    char *saveptr;                                          //save pointer for strtok_r
+    char *stage_cmd = strtok_r(cmd, "|", &saveptr);         //get first stage
+    
+    //parse each stage of the pipeline
     while(stage_cmd != NULL && numStages < MAX_PIPES){
-        //trim whitespace
-        while(*stage_cmd == ' ' || *stage_cmd == '\t' || *stage_cmd == '\n'){
-            stage_cmd++;
-        }
+        stage_cmd = skip_whitespace(stage_cmd);
         
-        //parse this stage using existing parser
-        char *args[MAX_ARGS];
-        char *inputFile = NULL;
-        char *outputFile = NULL;
-        char *errorFile = NULL;
+        //local variables to hold parsed information for this stage
+        char *args[MAX_ARGS];                   //command arguments array
+        char *inputFile = NULL;                  //input redirection file
+        char *outputFile = NULL;                //output redirection file
+        char *errorFile = NULL;                 //error redirection file
         
-        parse_command(stage_cmd, args, &inputFile, &outputFile, &errorFile);
+        parse_command(stage_cmd, args, &inputFile, &outputFile, &errorFile, 1);
         
-        //check if parsing failed (args[0] is NULL)
+        //check if parsing failed (args[0] is NULL indicates parsing error)
         if(args[0] == NULL){
-            return;                                     //don't execute pipeline
+            hasErrors = 1;                  //set error flag
+            numStages++;
+            stage_cmd = strtok_r(NULL, "|", &saveptr);
+            continue;
         }
         
         //copy to stage structure
@@ -102,6 +131,8 @@ void execute_pipeline(char *cmd){
             stages[numStages].args[k++] = args[i];
         }
         stages[numStages].args[k] = NULL;               //null-terminate immediately after last arg
+        
+        //store redirection information for this stage
         stages[numStages].inputFile = inputFile;
         stages[numStages].outputFile = outputFile;
         stages[numStages].errorFile = errorFile;
@@ -110,7 +141,13 @@ void execute_pipeline(char *cmd){
         stage_cmd = strtok_r(NULL, "|", &saveptr);
     }
     
+    //check if we have at least one valid stage to execute
     if(numStages == 0){
+        return;
+    }
+    
+    //don't execute pipeline if there were parsing errors
+    if(hasErrors){
         return;
     }
     
@@ -123,7 +160,7 @@ void execute_pipeline(char *cmd){
         }
     }
     
-    //fork children
+    //create a child process for each stage
     pid_t pids[MAX_PIPES];
     for(int i = 0; i < numStages; i++){
         pids[i] = fork();
@@ -131,228 +168,259 @@ void execute_pipeline(char *cmd){
         if(pids[i] < 0){
             perror("fork failed");
             return;
-        }else if(pids[i] == 0){                 //child process
-            //handle input redirection
-            if(stages[i].inputFile != NULL){
-                int fd_in = open(stages[i].inputFile, O_RDONLY);
-                if(fd_in < 0){
-                    printf("File not found: %s\n", stages[i].inputFile);
-                    exit(EXIT_FAILURE);
-                }
-                dup2(fd_in, STDIN_FILENO);
-                close(fd_in);
-            }else if(i > 0){
-                //connect to previous pipe
+        }else if(pids[i] == 0){
+            /*child process : execute this stage of the pipeline
+            connect input from previous stage
+            */
+            if(i > 0 && stages[i].inputFile == NULL){
                 dup2(pipes[i-1][0], STDIN_FILENO);
             }
-            
-            //handle output redirection
-            if(stages[i].outputFile != NULL){
-                int fd_out = creat(stages[i].outputFile, 0644);
-                if(fd_out < 0){
-                    perror("bad output file");
-                    exit(EXIT_FAILURE);
-                }
-                dup2(fd_out, STDOUT_FILENO);
-                close(fd_out);
-            }else if(i < numStages - 1){
-                //connect to next pipe
+            if(i < numStages - 1 && stages[i].outputFile == NULL){
                 dup2(pipes[i][1], STDOUT_FILENO);
             }
             
-            //handle error redirection
-            if(stages[i].errorFile != NULL){
-                int fd_err = creat(stages[i].errorFile, 0644);
-                if(fd_err < 0){
-                    perror("bad error file");
-                    exit(EXIT_FAILURE);
-                }
-                dup2(fd_err, STDERR_FILENO);
-                close(fd_err);
-            }
-            
-            //close all pipe file descriptors
-            for(int j = 0; j < numStages - 1; j++)  {
+            //close all pipe file descriptors in child
+            for(int j = 0; j < numStages - 1; j++){
                 close(pipes[j][0]);
                 close(pipes[j][1]);
             }
             
+            //handle explicit file redirections (override pipe connections)
+            if(stages[i].inputFile && setup_redirection(stages[i].inputFile, O_RDONLY, STDIN_FILENO) < 0){
+                exit(EXIT_FAILURE);
+            }
+            if(stages[i].outputFile && setup_redirection(stages[i].outputFile, O_WRONLY|O_CREAT|O_TRUNC, STDOUT_FILENO) < 0){
+                exit(EXIT_FAILURE);
+            }
+            if(stages[i].errorFile && setup_redirection(stages[i].errorFile, O_WRONLY|O_CREAT|O_TRUNC, STDERR_FILENO) < 0){
+                exit(EXIT_FAILURE);
+            }
+            
             //execute the command
-            if(execvp(stages[i].args[0], stages[i].args) < 0)   {
-                printf("Command not found.\n");
-                perror("exec failed");
+            if(execvp(stages[i].args[0], stages[i].args) < 0){
+                //if we reach here, execvp failed, and an error message is printed to stderr (not stdout) to avoid interfering with pipeline
+                fprintf(stderr, "Command not found in pipe sequence.\n");
                 exit(EXIT_FAILURE);
             }
         }
     }
     
-    //parent process - close all pipe file descriptors
+    /*parent process : close all pipes and wait for children
+    close all pipe file descriptors in parent
+    */
     for(int i = 0; i < numStages - 1; i++){
         close(pipes[i][0]);
         close(pipes[i][1]);
     }
     
-    //wait for the last process (minimum requirement)
-    waitpid(pids[numStages-1], NULL, 0);
+    //wait for the last process
+    int status;
+    waitpid(pids[numStages-1], &status, 0);
     
-    //optional: wait for all children to avoid zombies
+    //wait for all other children to avoid zombie processes
     for(int i = 0; i < numStages; i++){
         if(i != numStages-1){                       //don't wait twice for last process
-            waitpid(pids[i], NULL, 0);
+            waitpid(pids[i], &status, 0);
         }
     }
 }
 
-//function to parse command line
-void parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, char **errorFile) {
+/*command parsing function that extracts command arguments and redirection information
+tokenizes the input command and identifies redirection symbols
+returns 0 on success, -1 on error (with args[0] set to NULL)
+*/
+int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, char **errorFile, int isPipeline){
     int i = 0;
-    //split cmd string with strtok
+    *inputFile = *outputFile = *errorFile = NULL;
+    
     char *token = strtok(cmd, " \t\n");
-
     while (token != NULL) {
-        //check for redirection symbols
+        //handle redirection symbols
         if (strcmp(token, "<") == 0) {
-            token = strtok(NULL, " \t\n"); //next part is filename
-            if (token == NULL) {
+            char *filename = strtok(NULL, " \t\n");
+            if (filename == NULL) {
                 printf("Input file not specified.\n");
                 args[0] = NULL;
-                return;
+                return -1;
             }
-            *inputFile = token;
+            *inputFile = filename;
             token = strtok(NULL, " \t\n");
-            continue;                      //skip adding filename to args
+            continue;
         } else if (strcmp(token, ">") == 0) {
-            token = strtok(NULL, " \t\n"); //next part is filename
-            if (token == NULL) {
-                printf("Output file not specified.\n");
+            char *filename = strtok(NULL, " \t\n");
+            if (filename == NULL) {
+                //no filename provided after > symbol, different error message for pipelines vs single commands
+                if (isPipeline) {
+                    printf("Output file not specified after redirection.\n");
+                } else {
+                    printf("Output file not specified.\n");
+                }
                 args[0] = NULL;
-                return;
+                return -1;
             }
-            *outputFile = token;
+            *outputFile = filename;
             token = strtok(NULL, " \t\n");
-            continue;                      //skip adding filename to args
-        } else if (strcmp(token, "2>") == 0) {
-            token = strtok(NULL, " \t\n"); //next part is filename
-            if (token == NULL) {
+            continue;
+        } 
+        //handle error redirection symbol (2>)
+        else if (strcmp(token, "2>") == 0) {
+            char *filename = strtok(NULL, " \t\n");
+            if (filename == NULL) {
                 printf("Error output file not specified.\n");
                 args[0] = NULL;
-                return;
+                return -1;
             }
-            *errorFile = token;
+            *errorFile = filename;
             token = strtok(NULL, " \t\n");
-            continue;                      //skip adding filename to args
-        } else {
-            args[i++] = token;
+            continue;
         }
+        
+        //regular argument (not a redirection symbol)
+        //check if we have room for more arguments
+        if (i >= MAX_ARGS - 1) {
+            printf("Too many arguments.\n");
+            args[0] = NULL;
+            return -1;
+        }
+        //add this token to the arguments array
+        args[i++] = token;
         token = strtok(NULL, " \t\n");
     }
-    //execvp needs null at end
+    
+    //null-terminate the arguments array (required by execvp)
     args[i] = NULL;
+    
+    //check if we have at least one argument (command name)
+    if (i == 0) {
+        args[0] = NULL;
+        return -1;
+    }
+    return 0;
 }
 
-//function to run command
+/*helper function for file redirection that redirects file to standard streams
+This function opens a file and redirects it to stdin, stdout, or stderr
+Returns 0 on success, -1 on failure
+*/
+static int setup_redirection(const char *filename, int flags, int target_fd) {
+    //open the file with specified flags and permissions
+    //flags: O_RDONLY for input, O_WRONLY|O_CREAT|O_TRUNC for output
+    //0644: file permissions (read/write for owner, read for group/others)
+    int fd = open(filename, flags, 0644);
+    
+    if (fd < 0) {
+        if (flags & O_RDONLY) {
+            printf("File not found.\n");
+        } else {
+            perror("bad file");
+        }
+        return -1;
+    }
+    
+    //redirect the file descriptor to the target stream (stdin/stdout/stderr)
+    //dup2 makes target_fd point to the same file as fd
+    if (dup2(fd, target_fd) < 0) {
+        perror("dup2 failed");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+/*Execute a single command with optional file redirections
+This function creates a child process to run the command and handles redirections. The parent process waits for the child to complete before returning
+*/
 void execute_command(char *args[], char *inputFile, char *outputFile, char *errorFile) {
-    //make new process
+    //create a child process using fork()
     pid_t pid = fork();
 
-    if (pid < 0) {
-        //if fork didnt work
+    if(pid < 0){
         perror("fork failed");
-        exit(EXIT_FAILURE);
-    } else if (pid == 0) {
-        //in child process now
-
-        //handle input redirection <
-        if (inputFile != NULL) {
-            int fd_in = open(inputFile, O_RDONLY);
-            if (fd_in < 0) {
-                printf("File not found: %s\n", inputFile);
-                exit(EXIT_FAILURE);
-            }
-            //redirect stdin to file
-            dup2(fd_in, STDIN_FILENO);
-            close(fd_in); //close original fd
+        return;
+    }
+    
+    if (pid == 0) {
+        /*child process : execute the command with redirections
+        set up input redirection if specified
+        redirect stdin to read from inputFile
+        */
+        if (inputFile && setup_redirection(inputFile, O_RDONLY, STDIN_FILENO) < 0) {
+            exit(EXIT_FAILURE);
         }
-
-        //handle output redirection >
-        if (outputFile != NULL) {
-            //create file with permissions
-            int fd_out = creat(outputFile, 0644);
-            if (fd_out < 0) {
-                perror("bad output file");
-                exit(EXIT_FAILURE);
-            }
-            //redirect stdout to file
-            dup2(fd_out, STDOUT_FILENO);
-            close(fd_out);
+        
+        //set up output redirection if specified
+        //redirect stdout to write to outputFile
+        if (outputFile && setup_redirection(outputFile, O_WRONLY|O_CREAT|O_TRUNC, STDOUT_FILENO) < 0) {
+            exit(EXIT_FAILURE);
         }
-
-        //handle error redirection 2>
-        if (errorFile != NULL) {
-            int fd_err = creat(errorFile, 0644);
-            if (fd_err < 0) {
-                perror("bad error file");
-                exit(EXIT_FAILURE);
-            }
-            //redirect stderr to file
-            dup2(fd_err, STDERR_FILENO);
-            close(fd_err);
+        
+        //set up error redirection if specified
+        //redirect stderr to write to errorFile
+        if (errorFile && setup_redirection(errorFile, O_WRONLY|O_CREAT|O_TRUNC, STDERR_FILENO) < 0) {
+            exit(EXIT_FAILURE);
         }
-
-        //run the command
+        
+        /*execute the command using execvp
+        execvp replaces the current process with the new command
+        it searches PATH environment variable for the executable
+        */
         if (execvp(args[0], args) < 0) {
-            //execvp failed, something is wrong
             printf("Command not found.\n");
-            perror("exec failed");
             exit(EXIT_FAILURE);
         }
     } else {
-        //parent waits for child to finish
+        /*parent process : wait for child to complete
+        wait() blocks until child process terminates
+        this ensures the shell waits for command completion before showing next prompt
+        */
         wait(NULL);
     }
 }
 
-
+/*Main function
+This function implements the main shell loop that reads commands and executes them
+It handles both single commands and pipelines, with proper error handling
+*/
 int main() {
-    char cmd[MAX_CMD_LENGTH];      //holds typed command
-    char *args[MAX_ARGS];          //holds parsed args
-
-    //shell loop, runs forever
+    //buffer to store user input command
+    char cmd[MAX_CMD_LENGTH];
+    //array to store parsed command arguments
+    char *args[MAX_ARGS];
+    //point er to store redirection filenames
+    char *inputFile, *outputFile, *errorFile;
+    
     while (1) {
-        // 1.show prompt
+        //display shell prompt
         printf("$ ");
-        fflush(stdout); //show prompt right away
-
-        // 2.read command
-        if (fgets(cmd, sizeof(cmd), stdin) == NULL) {
-            //handles ctrl+d
+        
+        //read command from user input
+        if (fgets(cmd, MAX_CMD_LENGTH, stdin) == NULL) {
             break;
         }
-
-        // 3.check for "exit"
-        if (strcmp(cmd, "exit\n") == 0) {
-            break; //leave loop
-        }
-
-        // 4.parse it
-        char *inputFile = NULL;
-        char *outputFile = NULL;
-        char *errorFile = NULL;
         
-        //check if command contains pipes
+        //remove newline and skip empty commands
+        cmd[strcspn(cmd, "\n")] = '\0';
+        
+        //skip empty commands
+        if(strlen(cmd) == 0){
+            continue;
+        }
+        
+        //handle exit command
+        if(strcmp(cmd, "exit") == 0){
+            break;
+        }
+        
+        //execute command (pipeline or single)
         if(strchr(cmd, '|') != NULL){
-            //execute as pipeline
+            //command contains pipe symbol - execute as pipeline
             execute_pipeline(cmd);
-        }else{
-            //execute as single command
-            parse_command(cmd, args, &inputFile, &outputFile, &errorFile);
-
-            // 5.run it if not empty
-            if (args[0] != NULL) {
-                execute_command(args, inputFile, outputFile, errorFile);
-            }
+        }else if(parse_command(cmd, args, &inputFile, &outputFile, &errorFile, 0) == 0){
+            //single command - parse and execute if parsing succeeded
+            execute_command(args, inputFile, outputFile, errorFile);
         }
     }
-
+    
     return 0;
 }
