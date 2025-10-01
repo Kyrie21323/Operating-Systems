@@ -30,51 +30,46 @@ static char* skip_whitespace(char *str){
     return str;
 }
 
-/*utility function to check if a string is empty after removing leading/trailing whitespace
-This function determines if a string contains only whitespace characters
-*/
-static int is_empty_after_trim(char *str){
-    str = skip_whitespace(str);             //skip leading whitespace
-    return *str == '\0';                    //return true if we reached end of string (empty)
-}
 
 /*pipeline validation function to check if pipeline syntax is correct
 This function validates that pipes are used correctly and there are no empty commands. Returns 0 for valid pipeline, -1 for invalid pipeline with error message printed
 */
 int validate_pipeline(char *cmd){
-    //skip leading whitespace to find actual start of command
-    char *p = skip_whitespace(cmd);
-    
-    //check for leading pipe (command starts with |)
-    if(*p == '|'){
+    //work on a copy so we don't modify the original
+    size_t n = strlen(cmd) + 1;
+    char buf[n];
+    memcpy(buf, cmd, n);
+
+    //trim leading whitespace
+    char *p = skip_whitespace(buf);
+
+    //leading pipe check
+    if (*p == '|') {
         printf("Command missing after pipe.\n");
         return -1;
     }
-    
-    //check for trailing pipe
-    int len = strlen(p);
-    //work backwards from end, skipping trailing whitespace
-    while(len > 0 && (p[len-1] == ' ' || p[len-1] == '\t' || p[len-1] == '\n')){
-        len--;
-    }
-    //if last non-whitespace character is |, it's invalid
-    if(len > 0 && p[len-1] == '|'){
-        printf("Command missing after pipe.\n");
-        return -1;
-    }
-    
-    //check for empty commands between pipes
-    char *saveptr;
-    char *token = strtok_r(p, "|", &saveptr);               //split by pipe character
-    while(token != NULL){
-        //check if this token (command between pipes) is empty after trimming whitespace
-        if(is_empty_after_trim(token)){
-            printf("Empty command between pipes.\n");
-            return -1;
+
+    //scan to detect empties between pipes and trailing pipe
+    int saw_non_ws_since_pipe = 0;
+    for (char *q = p; *q; ++q) {
+        if (*q == '|') {
+            //if we hit a pipe and haven't seen a non-ws char since the last pipe, it's empty
+            if (!saw_non_ws_since_pipe) {
+                printf("Empty command between pipes.\n");
+                return -1;
+            }
+            saw_non_ws_since_pipe = 0; //reset for the next segment
+        } else if (*q != ' ' && *q != '\t' && *q != '\n') {
+            saw_non_ws_since_pipe = 1;
         }
-        token = strtok_r(NULL, "|", &saveptr);                  //get next token
     }
-    
+
+    //if the last segment had no non-ws (i.e., ended with '|' or only spaces after it)
+    if (!saw_non_ws_since_pipe) {
+        printf("Command missing after pipe.\n");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -170,22 +165,8 @@ void execute_pipeline(char *cmd){
             return;
         }else if(pids[i] == 0){
             /*child process : execute this stage of the pipeline
-            connect input from previous stage
+            handle explicit file redirections first (they override pipe connections)
             */
-            if(i > 0 && stages[i].inputFile == NULL){
-                dup2(pipes[i-1][0], STDIN_FILENO);
-            }
-            if(i < numStages - 1 && stages[i].outputFile == NULL){
-                dup2(pipes[i][1], STDOUT_FILENO);
-            }
-            
-            //close all pipe file descriptors in child
-            for(int j = 0; j < numStages - 1; j++){
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-            
-            //handle explicit file redirections (override pipe connections)
             if(stages[i].inputFile && setup_redirection(stages[i].inputFile, O_RDONLY, STDIN_FILENO) < 0){
                 exit(EXIT_FAILURE);
             }
@@ -194,6 +175,27 @@ void execute_pipeline(char *cmd){
             }
             if(stages[i].errorFile && setup_redirection(stages[i].errorFile, O_WRONLY|O_CREAT|O_TRUNC, STDERR_FILENO) < 0){
                 exit(EXIT_FAILURE);
+            }
+            
+            //connect input from previous stage (only if no explicit input redirection)
+            if(i > 0 && stages[i].inputFile == NULL){
+                dup2(pipes[i-1][0], STDIN_FILENO);
+            }
+            //connect output to next stage (only if no explicit output redirection)
+            if(i < numStages - 1 && stages[i].outputFile == NULL){
+                dup2(pipes[i][1], STDOUT_FILENO);
+            }
+            
+            //close pipe file descriptors that are not being used by this stage
+            for(int j = 0; j < numStages - 1; j++){
+                //close read end if this stage is not reading from this pipe
+                if(i == 0 || j != i-1){
+                    close(pipes[j][0]);
+                }
+                //close write end if this stage is not writing to this pipe
+                if(i == numStages-1 || j != i){
+                    close(pipes[j][1]);
+                }
             }
             
             //execute the command
@@ -303,22 +305,19 @@ This function opens a file and redirects it to stdin, stdout, or stderr
 Returns 0 on success, -1 on failure
 */
 static int setup_redirection(const char *filename, int flags, int target_fd) {
-    //open the file with specified flags and permissions
-    //flags: O_RDONLY for input, O_WRONLY|O_CREAT|O_TRUNC for output
-    //0644: file permissions (read/write for owner, read for group/others)
     int fd = open(filename, flags, 0644);
-    
     if (fd < 0) {
-        if (flags & O_RDONLY) {
+        //use the target stream, not flags (O_RDONLY is 0 on POSIX)
+        if (target_fd == STDIN_FILENO) {
+            //assignment requires this exact message on stdout
             printf("File not found.\n");
         } else {
+            //keep perror for output/error file issues
             perror("bad file");
         }
         return -1;
     }
-    
-    //redirect the file descriptor to the target stream (stdin/stdout/stderr)
-    //dup2 makes target_fd point to the same file as fd
+
     if (dup2(fd, target_fd) < 0) {
         perror("dup2 failed");
         close(fd);
