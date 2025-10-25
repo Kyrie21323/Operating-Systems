@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <unistd.h>
 
 /* Portable strdup to avoid feature-macro surprises */
 char *xstrdup(const char *s){

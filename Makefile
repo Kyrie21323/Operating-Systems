@@ -8,11 +8,12 @@ INCDIR  := include
 SRCDIR  := src
 OBJDIR  := build
 
-TARGET  := myshell
+TARGETS := myshell server client
 
 INCLUDES := -I$(INCDIR)
 
-SRC := \
+# Source files for the original shell
+SHELL_SRC := \
   $(SRCDIR)/main.c \
   $(SRCDIR)/parse.c \
   $(SRCDIR)/exec.c  \
@@ -20,13 +21,40 @@ SRC := \
   $(SRCDIR)/tokenize.c \
   $(SRCDIR)/util.c
 
-OBJ := $(SRC:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
+# Source files for server (includes shell modules + server + net)
+SERVER_SRC := \
+  $(SRCDIR)/parse.c \
+  $(SRCDIR)/exec.c  \
+  $(SRCDIR)/redir.c \
+  $(SRCDIR)/tokenize.c \
+  $(SRCDIR)/util.c \
+  $(SRCDIR)/net.c \
+  $(SRCDIR)/server.c
 
-.PHONY: all clean run
+# Source files for client (includes net + client)
+CLIENT_SRC := \
+  $(SRCDIR)/net.c \
+  $(SRCDIR)/client.c
 
-all: $(TARGET)
+# Object files
+SHELL_OBJ := $(SHELL_SRC:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
+SERVER_OBJ := $(SERVER_SRC:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
+CLIENT_OBJ := $(CLIENT_SRC:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 
-$(TARGET): $(OBJ)
+.PHONY: all clean run run-server run-client
+
+all: $(TARGETS)
+
+# Build original shell
+myshell: $(SHELL_OBJ)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
+# Build server
+server: $(SERVER_OBJ)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
+# Build client
+client: $(CLIENT_OBJ)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
@@ -35,8 +63,14 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
-run: $(TARGET)
-	./$(TARGET)
+run: myshell
+	./myshell
+
+run-server: server
+	./server 5050
+
+run-client: client
+	./client 127.0.0.1 5050
 
 clean:
-	rm -rf $(OBJDIR) $(TARGET)
+	rm -rf $(OBJDIR) $(TARGETS)
