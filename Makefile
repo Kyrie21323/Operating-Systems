@@ -1,24 +1,42 @@
-CC = gcc
+# Compiler and flags
+CC      := gcc
+CFLAGS  := -std=c11 -Wall -Wextra -O2
+# Define POSIX for strtok_r and other POSIX functions
+CFLAGS += -D_POSIX_C_SOURCE=200809L
 
-# compiler options
-# -wall shows all warnings
-# -g for debugging
-CFLAGS = -Wall -g
+INCDIR  := include
+SRCDIR  := src
+OBJDIR  := build
 
-# name of program
-TARGET = myshell
+TARGET  := myshell
 
-#c source file
-SRCS = myshell.c
+INCLUDES := -I$(INCDIR)
 
-# default rule, runs when you type 'make'
+SRC := \
+  $(SRCDIR)/main.c \
+  $(SRCDIR)/parse.c \
+  $(SRCDIR)/exec.c  \
+  $(SRCDIR)/redir.c \
+  $(SRCDIR)/tokenize.c \
+  $(SRCDIR)/util.c
+
+OBJ := $(SRC:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
+
+.PHONY: all clean run
+
 all: $(TARGET)
 
-#how to build the program
-$(TARGET): $(SRCS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS)
+$(TARGET): $(OBJ)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
-#how to clean the folder
+$(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJDIR):
+	mkdir -p $(OBJDIR)
+
+run: $(TARGET)
+	./$(TARGET)
+
 clean:
-	rm -f $(TARGET)
-
+	rm -rf $(OBJDIR) $(TARGET)
