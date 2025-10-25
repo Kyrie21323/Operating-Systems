@@ -3,7 +3,30 @@
 #include <string.h>   
 #include <unistd.h>   
 #include <sys/wait.h> 
-#include <fcntl.h>    
+#include <fcntl.h>
+#include <glob.h>
+#include <stdbool.h>
+#include <errno.h>    
+
+/* Portable strdup to avoid feature-macro surprises */
+static char *xstrdup(const char *s){
+    if(!s){
+        return NULL;
+    }
+    size_t n = strlen(s) + 1;
+    char *p = (char*)malloc(n);
+    if(!p){
+        perror("malloc"); _exit(127);
+    }
+    memcpy(p, s, n);
+    return p;
+}
+
+//token record for quote-aware parsing
+typedef struct {
+    char *val;
+    bool was_quoted;   //true if produced by quotes ('' or "")
+} QTok;
 
 //maximum length for command input buffer
 #define MAX_CMD_LENGTH 1024 
@@ -227,76 +250,244 @@ void execute_pipeline(char *cmd){
     }
 }
 
+/* Returns 0 on success, -1 on unclosed quote or OOM.
+   On success, *out = heap array of QToks (count elements). Caller frees.
+*/
+static int qtokenize(const char *line, QTok **out, int *count){
+    *out=NULL; *count=0;
+    const char *p=line;
+    bool in_s=false, in_d=false;
+    char buf[MAX_CMD_LENGTH];
+    int bl=0;
+
+    int cap=16, n=0;
+    QTok *arr = (QTok*)malloc(cap*sizeof(QTok));
+    if(!arr){ perror("malloc"); return -1; }
+
+    while(*p){
+        //skip ws when not in quotes and not in a token
+        while(!in_s && !in_d && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r')) p++;
+        if(!*p) break;
+
+        bool was_quoted=false;
+        bl=0;
+
+        while(*p){
+            if(in_s){
+                if(*p=='\''){ in_s=false; was_quoted=true; p++; continue; }
+                if(bl>=MAX_CMD_LENGTH-1){ free(arr); return -1; }
+                buf[bl++]=*p++;
+            } else if(in_d){
+                if(*p=='"'){ in_d=false; was_quoted=true; p++; continue; }
+                if(*p=='\\' && (p[1]=='"'||p[1]=='\\')){ p++; if(bl>=MAX_CMD_LENGTH-1){ free(arr); return -1; } buf[bl++]=*p++; }
+                else { if(bl>=MAX_CMD_LENGTH-1){ free(arr); return -1; } buf[bl++]=*p++; }
+            } else {
+                if(*p=='\''){ in_s=true; p++; continue; }
+                if(*p=='"'){ in_d=true; p++; continue; }
+                if(*p==' '||*p=='\t'||*p=='\n'||*p=='\r') break; /* token end */
+                if(*p=='|'||*p=='<'||*p=='>'){
+                    //operator ends token if we started; otherwise emit operator as its own token outside this loop
+                    if(bl==0) break;
+                    else break;
+                }
+                if(bl>=MAX_CMD_LENGTH-1){ free(arr); return -1; }
+                buf[bl++]=*p++;
+            }
+        }
+
+        //emit token if we captured any or if it was empty-quoted
+        if(bl>0 || was_quoted){
+            if(n==cap){ cap*=2; QTok *tmp=realloc(arr, cap*sizeof(QTok)); if(!tmp){ perror("realloc"); free(arr); return -1;} arr=tmp; }
+            buf[bl]='\0';
+            arr[n].val = xstrdup(buf);
+            arr[n].was_quoted = was_quoted;
+            n++;
+        }
+
+        //outside quotes: treat single-char | < > and two-char 2> as separate tokens
+        if(!in_s && !in_d){
+            while(*p==' '||*p=='\t'||*p=='\n'||*p=='\r') p++;
+            if(*p=='2' && p[1]=='>'){
+                if(n==cap){ cap*=2; QTok *tmp=realloc(arr, cap*sizeof(QTok)); if(!tmp){ perror("realloc"); free(arr); return -1;} arr=tmp; }
+                arr[n].val = xstrdup("2>");
+                arr[n].was_quoted=false; n++; p+=2;
+            } else if(*p=='|'||*p=='<'||*p=='>'){
+                char op[2]={*p,0};
+                if(n==cap){ cap*=2; QTok *tmp=realloc(arr, cap*sizeof(QTok)); if(!tmp){ perror("realloc"); free(arr); return -1;} arr=tmp; }
+                arr[n].val = xstrdup(op);
+                arr[n].was_quoted=false; n++; p++;
+            }
+        }
+    }
+
+    if(in_s||in_d){             //unclosed quote
+        for(int i=0;i<n;i++) free(arr[i].val);
+        free(arr);
+        return -1;
+    }
+
+    *out=arr; *count=n; return 0;
+}
+
+static void free_qtokens(QTok *arr, int n){ for(int i=0;i<n;i++) free(arr[i].val); free(arr); }
+
+//strip one pair of outer quotes from a string if present
+static char *strip_outer_quotes(const char *str) {
+    if(!str){
+        return NULL;
+    }
+    size_t len = strlen(str);
+    if(len < 2){
+        return xstrdup(str);
+    }
+    
+    //check for single quotes
+    if(str[0] == '\'' && str[len-1] == '\''){
+        char *result = malloc(len - 1);
+        if(!result){
+            perror("malloc");
+            _exit(127);
+        }
+        memcpy(result, str + 1, len - 2);
+        result[len - 2] = '\0';
+        return result;
+    }
+    
+    //check for double quotes
+    if(str[0] == '"' && str[len-1] == '"'){
+        char *result = malloc(len - 1);
+        if(!result){
+            perror("malloc"); _exit(127);
+        }
+        memcpy(result, str + 1, len - 2);
+        result[len - 2] = '\0';
+        return result;
+    }
+    
+    //no outer quotes, return copy
+    return xstrdup(str);
+}
+
+/* Expand * ? [ ] on unquoted argv words using glob(3).
+   Keeps redirection filenames unexpanded.
+*/
+static void apply_globbing(char **argv, bool *was_quoted, int *argc){
+    char *outv[MAX_ARGS]; bool outq[MAX_ARGS];
+    int m=0;
+
+    for(int i=0;i<*argc;i++){
+        char *w = argv[i];
+        bool q = was_quoted[i];
+
+        //detect redirection markers and skip the following filename
+        if((strcmp(w,"<")==0)||(strcmp(w,">")==0)||(strcmp(w,"2>")==0)){
+            if(m<MAX_ARGS-1){ outv[m]=w; outq[m]=false; m++; }
+            if(i+1<*argc){ outv[m]=argv[i+1]; outq[m]=true; m++; i++; }          //filename as-is
+            continue;
+        }
+
+        if(q){
+            //keep quoted tokens as-is
+            if(m<MAX_ARGS-1){ outv[m]=w; outq[m]=true; m++; }
+            continue;
+        }
+
+        //check for glob chars
+        bool hasg=false;
+        for(char *p=w; *p; ++p){ if(*p=='*'||*p=='?'||*p=='['||*p==']'){ hasg=true; break; } }
+
+        if(!hasg){
+            if(m<MAX_ARGS-1){ outv[m]=w; outq[m]=false; m++; }
+            continue;
+        }
+
+        glob_t gr; memset(&gr,0,sizeof(gr));
+        int rc = glob(w, GLOB_NOCHECK, NULL, &gr);
+        if(rc==0){
+            for(size_t j=0;j<gr.gl_pathc && m<MAX_ARGS-1;j++){
+                outv[m]=xstrdup(gr.gl_pathv[j]); outq[m]=false; m++;
+            }
+            free(w);             //was original token; replaced by duplicates
+        }else{
+            //fallback: keep as-is
+            if(m<MAX_ARGS-1){ outv[m]=w; outq[m]=false; m++; }
+        }
+        globfree(&gr);
+    }
+
+    //write back
+    for(int i=0;i<m;i++){ argv[i]=outv[i]; was_quoted[i]=outq[i]; }
+    *argc=m; argv[m]=NULL;
+}
+
 /*command parsing function that extracts command arguments and redirection information
 tokenizes the input command and identifies redirection symbols
 returns 0 on success, -1 on error (with args[0] set to NULL)
 */
 int parse_command(char *cmd, char *args[], char **inputFile, char **outputFile, char **errorFile, int isPipeline){
-    int i = 0;
     *inputFile = *outputFile = *errorFile = NULL;
-    
-    char *token = strtok(cmd, " \t\n");
-    while (token != NULL) {
-        //handle redirection symbols
-        if (strcmp(token, "<") == 0) {
-            char *filename = strtok(NULL, " \t\n");
-            if (filename == NULL) {
-                printf("Input file not specified.\n");
-                args[0] = NULL;
-                return -1;
-            }
-            *inputFile = filename;
-            token = strtok(NULL, " \t\n");
-            continue;
-        } else if (strcmp(token, ">") == 0) {
-            char *filename = strtok(NULL, " \t\n");
-            if (filename == NULL) {
-                //no filename provided after > symbol, different error message for pipelines vs single commands
-                if (isPipeline) {
-                    printf("Output file not specified after redirection.\n");
-                } else {
-                    printf("Output file not specified.\n");
-                }
-                args[0] = NULL;
-                return -1;
-            }
-            *outputFile = filename;
-            token = strtok(NULL, " \t\n");
-            continue;
-        } 
-        //handle error redirection symbol (2>)
-        else if (strcmp(token, "2>") == 0) {
-            char *filename = strtok(NULL, " \t\n");
-            if (filename == NULL) {
-                printf("Error output file not specified.\n");
-                args[0] = NULL;
-                return -1;
-            }
-            *errorFile = filename;
-            token = strtok(NULL, " \t\n");
-            continue;
-        }
-        
-        //regular argument (not a redirection symbol)
-        //check if we have room for more arguments
-        if (i >= MAX_ARGS - 1) {
-            printf("Too many arguments.\n");
-            args[0] = NULL;
-            return -1;
-        }
-        //add this token to the arguments array
-        args[i++] = token;
-        token = strtok(NULL, " \t\n");
+
+    QTok *toks=NULL; int nt=0;
+    if(qtokenize(cmd, &toks, &nt)!=0){
+        printf("Unclosed quotes.\n");
+        args[0]=NULL; return -1;
     }
-    
-    //null-terminate the arguments array (required by execvp)
-    args[i] = NULL;
-    
-    //check if we have at least one argument (command name)
-    if (i == 0) {
-        args[0] = NULL;
-        return -1;
+    if(nt==0){ args[0]=NULL; free_qtokens(toks,nt); return -1; }
+
+    //first pass: copy into args[] + parallel quoted flags
+    bool quoted[MAX_ARGS]; int ac=0;
+    for(int i=0;i<nt;i++){
+        if(ac>=MAX_ARGS-1){ printf("Too many arguments.\n"); free_qtokens(toks,nt); args[0]=NULL; return -1; }
+        args[ac] = toks[i].val;             //take ownership of the string
+        quoted[ac] = toks[i].was_quoted;
+        ac++;
     }
+    //toks array structure is no longer needed, but strings are now in args[], so free only the array
+    free(toks);
+
+    //validate redirections have filenames (only for unquoted operators)
+    for(int i=0;i<ac;i++){
+        if(!quoted[i] && (strcmp(args[i],"<")==0 || strcmp(args[i],">")==0 || strcmp(args[i],"2>")==0)){
+            if(i+1>=ac){ 
+                if(strcmp(args[i],"<")==0) printf("Input file not specified.\n");
+                else if(strcmp(args[i],">")==0) printf(isPipeline ? "Output file not specified after redirection.\n" : "Output file not specified.\n");
+                else printf("Error output file not specified.\n");
+                //free any heap strings in args[]
+                for(int k=0;k<ac;k++) free(args[k]);
+                args[0]=NULL; return -1;
+            }
+        }
+    }
+
+    //extract redirection filenames & remove the operator/filename pairs from argv (only for unquoted operators)
+    char *argv2[MAX_ARGS]; bool quoted2[MAX_ARGS]; int m=0;
+    for(int i=0;i<ac;i++){
+        if(!quoted[i] && strcmp(args[i],"<")==0){
+            *inputFile = strip_outer_quotes(args[i+1]); i++; continue;
+        }else if(!quoted[i] && strcmp(args[i],">")==0){
+            *outputFile = strip_outer_quotes(args[i+1]); i++; continue;
+        }else if(!quoted[i] && strcmp(args[i],"2>")==0){
+            *errorFile = strip_outer_quotes(args[i+1]); i++; continue;
+        }else{
+            argv2[m]=args[i]; quoted2[m]=quoted[i]; m++;
+        }
+    }
+    argv2[m]=NULL;
+
+    if(m==0){             //no command
+        if(*inputFile){ free(*inputFile); *inputFile=NULL; }
+        if(*outputFile){ free(*outputFile); *outputFile=NULL; }
+        if(*errorFile){ free(*errorFile); *errorFile=NULL; }
+        args[0]=NULL; return -1;
+    }
+
+    //apply globbing on unquoted argv words (NOT on redirection filenames)
+    apply_globbing(argv2, quoted2, &m);
+
+    //Copy back into args[]
+    for(int i=0;i<m;i++) args[i]=argv2[i];
+    args[m]=NULL;
+
     return 0;
 }
 
@@ -418,6 +609,19 @@ int main() {
         }else if(parse_command(cmd, args, &inputFile, &outputFile, &errorFile, 0) == 0){
             //single command - parse and execute if parsing succeeded
             execute_command(args, inputFile, outputFile, errorFile);
+            //free argv strings created by qtokenize/globbing
+            for(int i=0; args[i]!=NULL; i++){
+                free(args[i]);
+            }
+            if(inputFile){
+                free(inputFile);
+            }
+            if(outputFile){
+                free(outputFile);
+            }
+            if(errorFile){
+                free(errorFile);
+            }
         }
     }
     
